@@ -1,0 +1,40 @@
+name: Update EPG Daily
+
+on:
+  schedule:
+    # Runs every day at 6:00 AM UTC (2 AM Eastern / 11 PM Pacific)
+    - cron: '0 6 * * *'
+  workflow_dispatch: # Allows manual trigger from GitHub UI
+
+# Required: allows the workflow to write epg.xml.gz back to the repo
+permissions:
+  contents: write
+
+jobs:
+  update-epg:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install requests
+
+      - name: Fetch and compress EPG
+        env:
+          MYEPG_URL: ${{ secrets.MYEPG_URL }}
+        run: python scripts/fetch_epg.py
+
+      - name: Commit and push updated EPG
+        run: |
+          git config user.name "EPG Bot"
+          git config user.email "epg-bot@users.noreply.github.com"
+          git add epg.xml.gz
+          git diff --staged --quiet || git commit -m "Update EPG - $(date -u '+%Y-%m-%d %H:%M UTC')"
+          git push
