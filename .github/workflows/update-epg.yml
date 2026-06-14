@@ -3,7 +3,7 @@ name: Update EPG Daily
 on:
   schedule:
     # Runs every day at 6:00 AM UTC (2 AM Eastern / 11 PM Pacific)
-    - cron: '0 6 * * *'
+    - cron: '30 * * * *'
   workflow_dispatch: # Allows manual trigger from GitHub UI
 
 # Required: allows the workflow to write epg.xml.gz back to the repo
