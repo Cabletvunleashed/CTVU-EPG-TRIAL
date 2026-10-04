@@ -1,0 +1,55 @@
+name: Update EPG Hourly
+
+# Triggered hourly by cron-job.org via the GitHub API (workflow_dispatch).
+# GitHub's own `schedule:` trigger was removed: it ran late or not at all,
+# and its stray runs only added extra commits on top of cron-job.org's.
+on:
+  workflow_dispatch: # cron-job.org calls this; also lets you run it from the GitHub UI
+
+# Only one update at a time per repo; a second trigger waits instead of colliding
+concurrency:
+  group: update-epg
+  cancel-in-progress: false
+
+# Required: allows the workflow to write epg.xml.gz back to the repo
+permissions:
+  contents: write
+
+jobs:
+  update-epg:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install requests
+
+      # Fails (and skips publishing) if the download fails or the guide looks broken
+      - name: Fetch, check and compress EPG
+        env:
+          MYEPG_URL: ${{ secrets.MYEPG_URL }}
+        run: python scripts/fetch_epg.py
+
+      # Publishes as a single fresh commit and replaces the old history, so the
+      # repo stays ~20 MB instead of growing by ~500 MB a day.
+      # The raw.githubusercontent.com URL TiviMate uses does not change.
+      - name: Publish updated EPG
+        run: |
+          if git diff --quiet -- epg.xml.gz; then
+            echo "Guide unchanged — nothing to publish."
+            exit 0
+          fi
+          git config user.name "EPG Bot"
+          git config user.email "epg-bot@users.noreply.github.com"
+          git checkout --orphan publish
+          git add -A
+          git commit -q -m "Update EPG - $(date -u '+%Y-%m-%d %H:%M UTC')"
+          git push --force origin publish:${{ github.ref_name }}

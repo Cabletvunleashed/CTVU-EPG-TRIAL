@@ -1,0 +1,149 @@
+#!/usr/bin/env python3
+"""
+EPG Auto-Updater for TiviMate
+-----------------------------
+Fetches the source EPG, checks it looks healthy, compresses it to
+epg.xml.gz, and saves it so GitHub Actions can publish it to the repo.
+
+The source is a rolling window (~24h ahead), so this runs hourly
+(triggered by cron-job.org) to keep the guide topped up.
+
+If the download fails or the guide looks broken, it retries a few times;
+if every attempt fails it exits with an error WITHOUT touching epg.xml.gz,
+so the last good guide stays live.
+"""
+
+import os
+import re
+import sys
+import time
+import gzip
+import datetime
+import requests
+
+
+# ── CONFIG ────────────────────────────────────────────────────────────────────
+# URL is injected securely from GitHub Secrets — never hardcoded here
+MYEPG_URL = os.environ.get("MYEPG_URL")
+
+# Output filename — must match what update-epg.yml commits
+OUTPUT_FILE = "epg.xml.gz"
+
+# Sanity checks — a guide that fails these is not published
+MIN_CHANNELS = int(os.environ.get("MIN_CHANNELS", "10000"))
+MIN_HOURS_AHEAD = float(os.environ.get("MIN_HOURS_AHEAD", "12"))
+
+# Retries — rides out short source hiccups instead of waiting an hour
+ATTEMPTS = int(os.environ.get("FETCH_ATTEMPTS", "3"))
+RETRY_WAIT_SECONDS = int(os.environ.get("RETRY_WAIT_SECONDS", "120"))
+# ──────────────────────────────────────────────────────────────────────────────
+
+STOP_RE = re.compile(rb'stop="(\d{14})\s*([+-]\d{4})?"')
+
+
+def fetch_epg(url):
+    print("Fetching EPG from source...")
+    headers = {"User-Agent": "Mozilla/5.0 (compatible; EPG-Fetcher/1.0)"}
+
+    response = requests.get(url, headers=headers, timeout=120)
+    response.raise_for_status()
+
+    content = response.content
+    print(f"Received {len(content) / 1024 / 1024:.1f} MB from server")
+
+    # If source is already gzipped, decompress first so we re-compress cleanly
+    if content[:2] == b'\x1f\x8b':
+        print("Source is gzipped — decompressing to raw XML first...")
+        content = gzip.decompress(content)
+        print(f"Decompressed size: {len(content) / 1024 / 1024:.1f} MB")
+
+    return content
+
+
+def latest_stop_utc(raw_xml):
+    latest = None
+    for stamp, tz in STOP_RE.findall(raw_xml):
+        t = datetime.datetime.strptime(stamp.decode(), "%Y%m%d%H%M%S")
+        if tz:
+            sign = -1 if tz[:1] == b"-" else 1
+            t -= sign * datetime.timedelta(hours=int(tz[1:3]), minutes=int(tz[3:5]))
+        if latest is None or t > latest:
+            latest = t
+    return latest
+
+
+def validate(raw_xml, min_hours_ahead=MIN_HOURS_AHEAD):
+    """Return a list of problems; empty list means the guide is OK to publish."""
+    problems = []
+
+    if b"<tv" not in raw_xml[:2000] or not raw_xml.rstrip().endswith(b"</tv>"):
+        problems.append("file is not a complete XMLTV guide (missing <tv> or </tv>)")
+
+    channels = raw_xml.count(b"<channel ")
+    programmes = raw_xml.count(b"<programme ")
+    print(f"Channels: {channels}  Programmes: {programmes}")
+    if channels < MIN_CHANNELS:
+        problems.append(f"only {channels} channels (minimum {MIN_CHANNELS})")
+
+    latest = latest_stop_utc(raw_xml)
+    if latest is None:
+        problems.append("no programme times found")
+    else:
+        now = datetime.datetime.utcnow()
+        hours_ahead = (latest - now).total_seconds() / 3600
+        print(f"Guide runs until {latest:%Y-%m-%d %H:%M} UTC ({hours_ahead:.1f}h ahead)")
+        if hours_ahead < min_hours_ahead:
+            problems.append(f"guide only {hours_ahead:.1f}h ahead (minimum {min_hours_ahead}h)")
+
+    return problems
+
+
+def save_compressed(raw_bytes, path):
+    print(f"Compressing and saving to {path}...")
+    # mtime=0 keeps the output identical when the guide hasn't changed
+    with open(path, "wb") as out, gzip.GzipFile(filename="", mode="wb", fileobj=out, mtime=0) as f:
+        f.write(raw_bytes)
+
+    final_size = os.path.getsize(path) / 1024 / 1024
+    print(f"Done! Final file size: {final_size:.1f} MB")
+
+
+def main():
+    if not MYEPG_URL:
+        print("ERROR: MYEPG_URL secret is not set.")
+        print("Go to your GitHub repo > Settings > Secrets > Actions > New secret")
+        print("Name: MYEPG_URL  |  Value: your full EPG download URL")
+        sys.exit(1)
+
+    for attempt in range(1, ATTEMPTS + 1):
+        print(f"── Attempt {attempt} of {ATTEMPTS} ──")
+        try:
+            raw_xml = fetch_epg(MYEPG_URL)
+            problems = validate(raw_xml)
+        except requests.exceptions.Timeout:
+            problems = ["request timed out"]
+        except requests.exceptions.HTTPError as e:
+            problems = [f"HTTP error from source: {e} (check the MYEPG_URL secret is still valid)"]
+        except Exception as e:
+            problems = [f"unexpected failure: {e}"]
+
+        if not problems:
+            break
+
+        print("Attempt failed:")
+        for p in problems:
+            print(f"  - {p}")
+        if attempt < ATTEMPTS:
+            print(f"Retrying in {RETRY_WAIT_SECONDS}s...")
+            time.sleep(RETRY_WAIT_SECONDS)
+    else:
+        print(f"ERROR: All {ATTEMPTS} attempts failed — NOT publishing.")
+        print("The previous epg.xml.gz stays live.")
+        sys.exit(1)
+
+    save_compressed(raw_xml, OUTPUT_FILE)
+    print("EPG update complete!")
+
+
+if __name__ == "__main__":
+    main()
