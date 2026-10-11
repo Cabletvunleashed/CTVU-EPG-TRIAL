@@ -1,0 +1,113 @@
+name: Update EPG Hourly
+
+# Triggered hourly by cron-job.org via the GitHub API (workflow_dispatch).
+# GitHub's own `schedule:` trigger was removed: it ran late or not at all,
+# and its stray runs only added extra commits on top of cron-job.org's.
+on:
+  workflow_dispatch: # cron-job.org calls this; also lets you run it from the GitHub UI
+
+# Only one update at a time per repo; a second trigger waits instead of colliding
+concurrency:
+  group: update-epg
+  cancel-in-progress: false
+
+# Required: allows the workflow to write epg.xml.gz back to the repo
+permissions:
+  contents: write
+  actions: read   # to look up the previous run for the "recovered" alert
+
+jobs:
+  update-epg:
+    runs-on: ubuntu-24.04   # pinned; ubuntu-latest moves to 26 on 2026-10-19
+    timeout-minutes: 35
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install requests
+
+      # Fails (and skips publishing) if the download fails or the guide looks broken
+      - name: Fetch, check and compress EPG
+        id: fetch
+        env:
+          MYEPG_URL: ${{ secrets.MYEPG_URL }}
+        run: python scripts/fetch_epg.py
+
+      # Publishes as a single fresh commit and replaces the old history, so the
+      # repo stays ~20 MB instead of growing by ~500 MB a day.
+      # The raw.githubusercontent.com URL TiviMate uses does not change.
+      - name: Publish updated EPG
+        id: publish
+        run: |
+          if git diff --quiet -- epg.xml.gz; then
+            echo "Guide unchanged — nothing to publish."
+            exit 0
+          fi
+          git config user.name "EPG Bot"
+          git config user.email "epg-bot@users.noreply.github.com"
+          git checkout --orphan publish
+          git add -A
+          git commit -q -m "Update EPG - $(date -u '+%Y-%m-%d %H:%M UTC')"
+          git push --force origin publish:${{ github.ref_name }}
+
+      # Low-priority phone heads-up when an hourly update fails. Customers keep
+      # the previous guide; the health check sends an urgent alert if it gets low.
+      - name: Push notification on failure (ntfy)
+        if: failure()
+        env:
+          NTFY_URL: ${{ secrets.NTFY_URL }}
+          NTFY_TOKEN: ${{ secrets.NTFY_TOKEN }}
+          FETCH: ${{ steps.fetch.outcome }}
+          ERROR: ${{ steps.fetch.outputs.error }}
+          PUBLISH: ${{ steps.publish.outcome }}
+          FEED: ${{ github.event.repository.name }}
+          THIS_RUN: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          if [ -z "$NTFY_URL" ]; then echo "NTFY_URL secret not set — skipping push."; exit 0; fi
+          if [ "$FETCH" = "failure" ]; then
+            why="Source download failed after 5 attempts (~18 min).${ERROR:+ Last error: $ERROR.}"
+          elif [ "$PUBLISH" = "failure" ]; then
+            why="Publishing to GitHub failed."
+          else
+            why="The run failed before fetching (GitHub-side problem)."
+          fi
+          auth=(); [ -n "$NTFY_TOKEN" ] && auth=(-H "Authorization: Bearer $NTFY_TOKEN")
+          curl -fsS --retry 3 "${auth[@]}" \
+            -H "Title: EPG update failed: $FEED" -H "Priority: low" -H "Tags: warning" \
+            -H "Click: $THIS_RUN" \
+            -d "$why Customers keep the previous guide; the next hourly run will retry." \
+            "$NTFY_URL" > /dev/null && echo "Push sent."
+
+      # One "all clear" push when an update succeeds right after a failure,
+      # so a quiet phone always means the feed is fine.
+      - name: Push notification on recovery (ntfy)
+        if: success()
+        env:
+          NTFY_URL: ${{ secrets.NTFY_URL }}
+          NTFY_TOKEN: ${{ secrets.NTFY_TOKEN }}
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          FEED: ${{ github.event.repository.name }}
+          THIS_RUN: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          if [ -z "$NTFY_URL" ]; then exit 0; fi
+          # Count failed runs immediately before this one (ignoring cancelled/skipped)
+          failed=$(gh run list --workflow update-epg.yml --status completed --limit 30 \
+            --json conclusion,databaseId \
+            --jq "[.[] | select(.databaseId != ${{ github.run_id }}) | select(.conclusion == \"success\" or .conclusion == \"failure\") | .conclusion]
+                  | (index(\"success\") // length)") || { echo "Could not read run history."; exit 0; }
+          if [ "${failed:-0}" -eq 0 ]; then echo "Previous run was fine — nothing to report."; exit 0; fi
+          [ "$failed" -eq 1 ] && what="1 failed update" || what="$failed failed updates in a row"
+          auth=(); [ -n "$NTFY_TOKEN" ] && auth=(-H "Authorization: Bearer $NTFY_TOKEN")
+          curl -fsS --retry 3 "${auth[@]}" \
+            -H "Title: EPG recovered: $FEED" -H "Priority: low" -H "Tags: white_check_mark" \
+            -H "Click: $THIS_RUN" \
+            -d "Update succeeded after $what. Customers have a fresh guide." \
+            "$NTFY_URL" > /dev/null && echo "Push sent."
