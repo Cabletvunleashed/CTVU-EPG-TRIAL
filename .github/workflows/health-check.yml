@@ -1,0 +1,192 @@
+name: EPG Health Check
+
+# Checks the live feed customers download. If it's broken or running low on
+# guide data, it re-runs the update (self-heal) and opens a GitHub issue to
+# alert the owner; the issue is closed automatically once the feed recovers.
+#
+# Two independent triggers so one failing doesn't silence the other:
+#   - cron-job.org (workflow_dispatch), every few hours
+#   - GitHub's own schedule as a backup (may run late; fine for a check)
+on:
+  workflow_dispatch:
+    inputs:
+      healthy_hours_ahead:
+        description: 'Hours of guide ahead required to count as healthy (raise to test alerts)'
+        required: false
+        default: '18'
+      test_ntfy:
+        description: 'Send a test push notification (true/false)'
+        required: false
+        default: 'false'
+  schedule:
+    - cron: '17 */3 * * *'
+
+concurrency:
+  group: health-check
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  actions: write   # to trigger the update workflow
+  issues: write    # to open/close the alert issue
+
+env:
+  FEED_URL: https://raw.githubusercontent.com/${{ github.repository }}/${{ github.event.repository.default_branch }}/epg.xml.gz
+  GH_TOKEN: ${{ github.token }}
+  GH_REPO: ${{ github.repository }}
+  ALERT_LABEL: epg-health
+  HEALTHY_HOURS_AHEAD: ${{ inputs.healthy_hours_ahead || '18' }}
+
+jobs:
+  health-check:
+    runs-on: ubuntu-24.04   # pinned; ubuntu-latest moves to 26 on 2026-10-19
+    timeout-minutes: 40
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install requests
+
+      - name: Check live feed
+        id: check
+        run: python scripts/health_check.py
+
+      # ── Self-heal: re-run the update and wait for it ─────────────────────────
+      - name: Self-heal — run EPG update
+        id: heal
+        if: steps.check.outputs.healthy != 'true'
+        run: |
+          before=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          gh workflow run update-epg.yml --ref "${{ github.event.repository.default_branch }}"
+          # Find the run we just started
+          for i in $(seq 1 12); do
+            sleep 10
+            run_id=$(gh run list --workflow update-epg.yml --event workflow_dispatch --limit 5 \
+              --json databaseId,createdAt --jq "[.[] | select(.createdAt >= \"$before\")][-1].databaseId // empty")
+            [ -n "$run_id" ] && break
+          done
+          if [ -z "$run_id" ]; then echo "Could not find the update run."; exit 0; fi
+          echo "run_url=${{ github.server_url }}/${{ github.repository }}/actions/runs/$run_id" >> "$GITHUB_OUTPUT"
+          gh run watch "$run_id" --exit-status > /dev/null && echo "result=success" >> "$GITHUB_OUTPUT" \
+            || echo "result=failure" >> "$GITHUB_OUTPUT"
+
+      - name: Re-check live feed after heal
+        id: recheck
+        if: steps.check.outputs.healthy != 'true'
+        run: |
+          sleep 60   # give the CDN a moment to serve the new file
+          python scripts/health_check.py
+
+      # ── Alert: open/update/close the health issue ────────────────────────────
+      - name: Update alert issue
+        id: alert
+        if: always()
+        env:
+          FIRST: ${{ steps.check.outputs.healthy }}
+          FIRST_SUMMARY: ${{ steps.check.outputs.summary }}
+          AFTER: ${{ steps.recheck.outputs.healthy }}
+          AFTER_SUMMARY: ${{ steps.recheck.outputs.summary }}
+          HEAL_RESULT: ${{ steps.heal.outputs.result }}
+          HEAL_URL: ${{ steps.heal.outputs.run_url }}
+          THIS_RUN: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          now=$(date -u '+%Y-%m-%d %H:%M UTC')
+          gh label create "$ALERT_LABEL" --color D93F0B --description "EPG feed health alerts" --force > /dev/null
+          issue=$(gh issue list --label "$ALERT_LABEL" --state open --limit 1 --json number --jq '.[0].number // empty')
+
+          if [ "$FIRST" = "true" ]; then
+            state=healthy
+          elif [ "$AFTER" = "true" ]; then
+            state=healed
+          else
+            state=down
+          fi
+          echo "Feed state: $state"
+          echo "state=$state" >> "$GITHUB_OUTPUT"
+          [ -n "$issue" ] && echo "had_issue=true" >> "$GITHUB_OUTPUT"
+
+          body="**$now** — feed state: **$state**
+          - Live feed check: ${FIRST_SUMMARY:-unknown}
+          - Self-heal update run: ${HEAL_RESULT:-not needed} ${HEAL_URL}
+          - Re-check after heal: ${AFTER_SUMMARY:-n/a}
+          - Health-check run: $THIS_RUN"
+
+          case "$state" in
+            down)
+              if [ -n "$issue" ]; then
+                gh issue comment "$issue" --body "Still unhealthy. $body"
+              else
+                gh issue create --label "$ALERT_LABEL" \
+                  --title "EPG feed unhealthy: ${{ github.event.repository.name }}" \
+                  --body "The live EPG feed failed its health check and the automatic re-run did not fix it. Customers may start seeing missing guide data.
+
+          $body
+
+          Common causes: the source URL (MYEPG_URL secret) changed or expired, the source is down, or cron-job.org stopped triggering updates. This issue closes itself when the feed is healthy again."
+              fi
+              exit 1 ;;
+            healed)
+              if [ -n "$issue" ]; then
+                gh issue comment "$issue" --body "Recovered after automatic re-run. $body"
+                gh issue close "$issue"
+              else
+                num=$(gh issue create --label "$ALERT_LABEL" \
+                  --title "EPG feed auto-healed: ${{ github.event.repository.name }}" \
+                  --body "The live feed failed its health check, but an automatic re-run fixed it. No action needed — this is just a heads-up in case it keeps happening.
+
+          $body" | grep -o '[0-9]*$')
+                gh issue close "$num"
+              fi ;;
+            healthy)
+              if [ -n "$issue" ]; then
+                gh issue comment "$issue" --body "Feed is healthy again. $body"
+                gh issue close "$issue"
+              fi ;;
+          esac
+
+      # ── Phone alert via ntfy ─────────────────────────────────────────────────
+      # Needs repo secret NTFY_URL (full topic URL, e.g. https://ntfy.sh/your-secret-topic).
+      # Optional NTFY_TOKEN for a protected/self-hosted ntfy server. Skipped if unset.
+      - name: Push notification (ntfy)
+        if: always()
+        env:
+          NTFY_URL: ${{ secrets.NTFY_URL }}
+          NTFY_TOKEN: ${{ secrets.NTFY_TOKEN }}
+          STATE: ${{ steps.alert.outputs.state }}
+          HAD_ISSUE: ${{ steps.alert.outputs.had_issue }}
+          TEST: ${{ inputs.test_ntfy }}
+          FIRST_SUMMARY: ${{ steps.check.outputs.summary }}
+          AFTER_SUMMARY: ${{ steps.recheck.outputs.summary }}
+          FEED: ${{ github.event.repository.name }}
+          THIS_RUN: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          if [ -z "$NTFY_URL" ]; then echo "NTFY_URL secret not set — skipping push."; exit 0; fi
+
+          if [ "$TEST" = "true" ]; then
+            title="EPG test: $FEED"; prio=default; tags=test_tube
+            msg="Test notification from the $FEED health check. Current state: ${STATE:-unknown}."
+          elif [ "$STATE" = "down" ]; then
+            title="EPG DOWN: $FEED"; prio=urgent; tags=rotating_light
+            msg="Feed failed its health check and the automatic re-run did not fix it. ${AFTER_SUMMARY:-$FIRST_SUMMARY}"
+          elif [ "$STATE" = "healed" ]; then
+            title="EPG auto-healed: $FEED"; prio=default; tags=wrench
+            msg="Feed was unhealthy (${FIRST_SUMMARY}) but an automatic re-run fixed it. No action needed."
+          elif [ "$STATE" = "healthy" ] && [ "$HAD_ISSUE" = "true" ]; then
+            title="EPG recovered: $FEED"; prio=default; tags=white_check_mark
+            msg="Feed is healthy again. Alert issue closed."
+          else
+            echo "Feed healthy, nothing to report."; exit 0
+          fi
+
+          auth=(); [ -n "$NTFY_TOKEN" ] && auth=(-H "Authorization: Bearer $NTFY_TOKEN")
+          curl -fsS --retry 3 "${auth[@]}" \
+            -H "Title: $title" -H "Priority: $prio" -H "Tags: $tags" \
+            -H "Click: $THIS_RUN" \
+            -d "$msg" "$NTFY_URL" > /dev/null && echo "Push sent: $title"
